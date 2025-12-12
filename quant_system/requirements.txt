@@ -1,0 +1,43 @@
+# requirements.txt
+# 量化交易系统依赖
+
+# === 核心框架 ===
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# === 异步 ===
+asyncio-throttle>=1.0.2
+
+# === 数据处理 ===
+orjson>=3.9.0,<4.0.0
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+
+# === 存储 ===
+redis>=5.0.0,<6.0.0
+clickhouse-driver>=0.2.6,<1.0.0
+
+# === 监控 ===
+prometheus-client>=0.19.0,<1.0.0
+
+# === 告警 ===
+httpx>=0.25.0,<1.0.0
+
+# === CTP SDK (需要单独安装) ===
+# pyctp>=6.6.9  # 需要从 https://github.com/openctp/openctp-python 安装
+
+# === 测试 ===
+pytest>=7.4.0,<8.0.0
+pytest-asyncio>=0.21.0,<1.0.0
+pytest-benchmark>=4.0.0,<5.0.0
+pytest-cov>=4.1.0,<5.0.0
+
+# === 代码质量 ===
+mypy>=1.7.0,<2.0.0
+pylint>=3.0.0,<4.0.0
+bandit>=1.7.0,<2.0.0
+black>=23.0.0,<24.0.0
+isort>=5.12.0,<6.0.0
+
+# === 类型存根 ===
+types-redis>=4.6.0

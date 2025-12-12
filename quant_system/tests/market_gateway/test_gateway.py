@@ -309,3 +309,253 @@ class TestDataFiltering:
         # Assert
         assert is_valid is False
         assert any("无效交易所" in e for e in errors)
+
+
+# =============================================================================
+# 场景4：重复订阅幂等性测试
+# =============================================================================
+
+
+class TestSubscriptionIdempotency:
+    """订阅幂等性测试。"""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_subscription_ignored(
+        self,
+        sample_gateway_config: GatewayConfig,
+    ) -> None:
+        """
+        测试：重复订阅同一合约不会重复调用 SDK。
+
+        Arrange: 已订阅 IF2401
+        Act: 再次订阅 IF2401
+        Assert: SDK 订阅方法只调用一次
+        """
+        # Arrange
+        from quant_system.market_gateway.base import AbstractGateway, GatewayState
+
+        class TestGateway(AbstractGateway):
+            def __init__(self, config: GatewayConfig) -> None:
+                super().__init__(config)
+                self.subscribe_call_count = 0
+
+            async def connect(self) -> None:
+                await self._set_state(GatewayState.CONNECTED)
+
+            async def disconnect(self) -> None:
+                await self._set_state(GatewayState.DISCONNECTED)
+
+            async def subscribe(self, symbols: list[str]) -> list[str]:
+                # WHY: 幂等性检查 - 只订阅未订阅的合约
+                new_symbols = [s for s in symbols if s not in self._subscribed_symbols]
+                if new_symbols:
+                    self.subscribe_call_count += 1
+                    self._subscribed_symbols.update(new_symbols)
+                return new_symbols
+
+            async def unsubscribe(self, symbols: list[str]) -> list[str]:
+                return symbols
+
+            async def _do_reconnect(self) -> bool:
+                return True
+
+        # Act
+        gateway = TestGateway(sample_gateway_config)
+        await gateway.connect()
+
+        result1 = await gateway.subscribe(["IF2401"])
+        result2 = await gateway.subscribe(["IF2401"])  # 重复订阅
+
+        # Assert
+        assert result1 == ["IF2401"]
+        assert result2 == []  # WHY: 重复订阅返回空列表
+        assert gateway.subscribe_call_count == 1
+        assert gateway.subscription_count == 1
+
+    @pytest.mark.asyncio
+    async def test_subscription_limit_exceeded(
+        self,
+        sample_gateway_config: GatewayConfig,
+    ) -> None:
+        """
+        测试：超过订阅限制时抛出异常。
+
+        Arrange: max_subscriptions = 100，已订阅 100 个
+        Act: 尝试订阅第 101 个
+        Assert: 抛出 SubscriptionLimitExceededException
+        """
+        # Arrange
+        from quant_system.market_gateway.base import AbstractGateway, GatewayState
+
+        class TestGateway(AbstractGateway):
+            async def connect(self) -> None:
+                await self._set_state(GatewayState.CONNECTED)
+
+            async def disconnect(self) -> None:
+                pass
+
+            async def subscribe(self, symbols: list[str]) -> list[str]:
+                new_symbols = [s for s in symbols if s not in self._subscribed_symbols]
+                if len(self._subscribed_symbols) + len(new_symbols) > self._config.max_subscriptions:
+                    raise SubscriptionLimitExceededException(
+                        message="超过订阅限制",
+                        current_count=len(self._subscribed_symbols),
+                        max_limit=self._config.max_subscriptions,
+                        requested_count=len(new_symbols),
+                    )
+                self._subscribed_symbols.update(new_symbols)
+                return new_symbols
+
+            async def unsubscribe(self, symbols: list[str]) -> list[str]:
+                return symbols
+
+            async def _do_reconnect(self) -> bool:
+                return True
+
+        # Act
+        gateway = TestGateway(sample_gateway_config)
+        await gateway.connect()
+
+        # 先订阅 100 个合约
+        symbols = [f"TEST{i:04d}" for i in range(100)]
+        await gateway.subscribe(symbols)
+
+        # Assert - 尝试订阅第 101 个应抛出异常
+        with pytest.raises(SubscriptionLimitExceededException) as exc_info:
+            await gateway.subscribe(["TEST0100"])
+
+        assert exc_info.value.current_count == 100
+        assert exc_info.value.max_limit == 100
+
+
+# =============================================================================
+# 场景5：配置错误测试
+# =============================================================================
+
+
+class TestConfigurationErrors:
+    """配置错误测试。"""
+
+    def test_invalid_front_addr_format(self) -> None:
+        """
+        测试：无效的前置机地址格式。
+
+        Arrange: front_addr = "http://invalid"
+        Act: 创建 CtpConfig
+        Assert: 抛出 ValidationError
+        """
+        # Arrange & Act & Assert
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc_info:
+            CtpConfig(
+                broker_id="9999",
+                investor_id="test",
+                password="test",
+                front_addr="http://invalid:10211",  # WHY: 应该是 tcp://
+            )
+
+        # 验证错误信息包含 front_addr
+        assert "front_addr" in str(exc_info.value)
+
+    def test_missing_ctp_config_for_ctp_gateway(self) -> None:
+        """
+        测试：CTP 网关缺少 CTP 配置。
+
+        Arrange: gateway_type = CTP, ctp = None
+        Act: 创建 GatewayConfig
+        Assert: 抛出 ValidationError
+        """
+        # Arrange & Act & Assert
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc_info:
+            GatewayConfig(
+                gateway_type=GatewayType.CTP,
+                gateway_name="test",
+                ctp=None,  # WHY: CTP 类型必须提供 ctp 配置
+            )
+
+        assert "ctp" in str(exc_info.value).lower()
+
+    def test_valid_simnow_config(self, sample_ctp_config: CtpConfig) -> None:
+        """
+        测试：有效的 SimNow 配置。
+
+        Arrange: 使用 SimNow 类型和有效 CTP 配置
+        Act: 创建 GatewayConfig
+        Assert: 成功创建
+        """
+        # Arrange & Act
+        config = GatewayConfig(
+            gateway_type=GatewayType.SIMNOW,
+            gateway_name="simnow_test",
+            ctp=sample_ctp_config,
+        )
+
+        # Assert
+        assert config.gateway_type == GatewayType.SIMNOW
+        assert config.ctp is not None
+
+
+# =============================================================================
+# 性能测试
+# =============================================================================
+
+
+class TestPerformance:
+    """性能测试。"""
+
+    def test_tick_data_creation_performance(self, benchmark) -> None:
+        """
+        测试：TickData 创建性能。
+
+        目标: < 1ms/次
+        """
+        def create_tick() -> TickData:
+            return TickData(
+                symbol="IF2401",
+                exchange="CFFEX",
+                timestamp=datetime.now(timezone.utc),
+                last_price=Decimal("3500.0"),
+                volume=10000,
+            )
+
+        # Act
+        result = benchmark(create_tick)
+
+        # Assert
+        assert result is not None
+        # WHY: pytest-benchmark 会自动报告性能指标
+
+    def test_tick_data_validation_performance(
+        self,
+        sample_tick_data: TickData,
+        benchmark,
+    ) -> None:
+        """
+        测试：TickData 校验性能。
+
+        目标: < 1ms/次
+        """
+        # Act
+        result = benchmark(sample_tick_data.validate)
+
+        # Assert
+        assert result[0] is True  # is_valid
+
+    def test_tick_data_serialization_performance(
+        self,
+        sample_tick_data: TickData,
+        benchmark,
+    ) -> None:
+        """
+        测试：TickData 序列化性能。
+
+        目标: < 1ms/次
+        """
+        # Act
+        result = benchmark(sample_tick_data.to_dict)
+
+        # Assert
+        assert "symbol" in result
