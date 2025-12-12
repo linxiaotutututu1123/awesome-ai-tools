@@ -338,3 +338,177 @@ class DataException(GatewayException):
         super().__init__(message, error_code, enriched_context, cause)
         self.symbol: Final[str] = symbol
         self.raw_data_summary: Final[str] = raw_summary
+
+
+class InvalidTickDataException(DataException):
+    """
+    无效Tick数据异常。
+
+    场景：价格为负、时间戳无效、字段缺失等。
+
+    Attributes:
+        invalid_field: 无效字段名
+        invalid_value: 无效字段值
+        expected: 期望值描述
+    """
+
+    __slots__ = ("invalid_field", "invalid_value", "expected")
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.DATA_INVALID,
+        context: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
+        *,
+        symbol: str = "",
+        raw_data: Any = None,
+        invalid_field: str = "",
+        invalid_value: Any = None,
+        expected: str = "",
+    ) -> None:
+        enriched_context = dict(context) if context else {}
+        # WHY: 记录具体哪个字段出问题，加速定位
+        enriched_context["invalid_field"] = invalid_field
+        enriched_context["invalid_value"] = repr(invalid_value)
+        enriched_context["expected"] = expected
+
+        super().__init__(message, error_code, enriched_context, cause, symbol=symbol, raw_data=raw_data)
+        self.invalid_field: Final[str] = invalid_field
+        self.invalid_value: Final[Any] = invalid_value
+        self.expected: Final[str] = expected
+
+
+class DataValidationException(DataException):
+    """
+    数据校验失败异常。
+
+    用于批量校验场景，可包含多个校验错误。
+
+    Attributes:
+        validation_errors: 校验错误列表 [(field, error_msg), ...]
+    """
+
+    __slots__ = ("validation_errors",)
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.DATA_VALIDATION_FAILED,
+        context: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
+        *,
+        symbol: str = "",
+        raw_data: Any = None,
+        validation_errors: list[tuple[str, str]] | None = None,
+    ) -> None:
+        enriched_context = dict(context) if context else {}
+        # WHY: 批量校验时一次性返回所有错误，减少往返
+        enriched_context["validation_errors"] = validation_errors or []
+        enriched_context["error_count"] = len(validation_errors or [])
+
+        super().__init__(message, error_code, enriched_context, cause, symbol=symbol, raw_data=raw_data)
+        self.validation_errors: Final[list[tuple[str, str]]] = validation_errors or []
+
+
+# =============================================================================
+# 订阅类异常 (1300-1399)
+# =============================================================================
+
+
+class SubscriptionException(GatewayException):
+    """
+    订阅相关异常的基类。
+
+    用于合约订阅、退订等场景。
+
+    Attributes:
+        symbols: 相关合约列表
+    """
+
+    __slots__ = ("symbols",)
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.SUBSCRIPTION_FAILED,
+        context: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
+        *,
+        symbols: list[str] | None = None,
+    ) -> None:
+        enriched_context = dict(context) if context else {}
+        # WHY: 记录涉及的合约便于排查
+        enriched_context["symbols"] = symbols or []
+        enriched_context["symbol_count"] = len(symbols or [])
+
+        super().__init__(message, error_code, enriched_context, cause)
+        self.symbols: Final[list[str]] = symbols or []
+
+
+class SubscriptionLimitExceededException(SubscriptionException):
+    """
+    订阅数量超限异常。
+
+    Attributes:
+        current_count: 当前已订阅数量
+        max_limit: 最大允许数量
+        requested_count: 本次请求订阅数量
+    """
+
+    __slots__ = ("current_count", "max_limit", "requested_count")
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.SUBSCRIPTION_LIMIT_EXCEEDED,
+        context: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
+        *,
+        symbols: list[str] | None = None,
+        current_count: int = 0,
+        max_limit: int = 1000,
+        requested_count: int = 0,
+    ) -> None:
+        enriched_context = dict(context) if context else {}
+        # WHY: 超限信息对于调整订阅策略很重要
+        enriched_context["current_count"] = current_count
+        enriched_context["max_limit"] = max_limit
+        enriched_context["requested_count"] = requested_count
+
+        super().__init__(message, error_code, enriched_context, cause, symbols=symbols)
+        self.current_count: Final[int] = current_count
+        self.max_limit: Final[int] = max_limit
+        self.requested_count: Final[int] = requested_count
+
+
+class SymbolNotFoundException(SubscriptionException):
+    """
+    合约不存在异常。
+
+    Attributes:
+        symbol: 未找到的合约代码
+        suggestion: 建议的相似合约（如有）
+    """
+
+    __slots__ = ("symbol", "suggestion")
+
+    def __init__(
+        self,
+        message: str,
+        error_code: ErrorCode = ErrorCode.SYMBOL_NOT_FOUND,
+        context: dict[str, Any] | None = None,
+        cause: BaseException | None = None,
+        *,
+        symbol: str = "",
+        suggestion: str = "",
+    ) -> None:
+        enriched_context = dict(context) if context else {}
+        enriched_context["symbol"] = symbol
+        # WHY: 提供相似合约建议改善用户体验
+        if suggestion:
+            enriched_context["suggestion"] = suggestion
+
+        super().__init__(message, error_code, enriched_context, cause, symbols=[symbol] if symbol else None)
+        self.symbol: Final[str] = symbol
+        self.suggestion: Final[str] = suggestion
