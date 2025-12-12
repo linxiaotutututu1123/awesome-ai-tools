@@ -20,15 +20,26 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
-import logging
+import random
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from typing import Any, Final, Callable
 import threading
 
 from .base import AbstractGateway, GatewayState
 from .config import GatewayConfig
+from .timezone import CHINA_TZ, UTC_TZ, to_china_time, validate_timestamp, get_trading_day
+from .metrics import (
+    record_tick_received,
+    record_tick_filtered,
+    record_tick_latency,
+    set_gateway_state,
+    set_gateway_subscriptions,
+    record_reconnect,
+    set_queue_size,
+)
+from .logging_config import get_gateway_logger, get_audit_logger
 from .models import TickData, DepthData, BarData, BarPeriod, PriceLevel, DataStatus
 from .exceptions import (
     ConnectionException,
@@ -89,6 +100,9 @@ class CtpMarketGateway(AbstractGateway):
     _TICK_CACHE_SIZE: Final[int] = 150000  # 约 30 秒 @ 5000 ticks/s
     _LOGIN_TIMEOUT: Final[float] = 10.0
     _SUBSCRIBE_BATCH_SIZE: Final[int] = 100  # CTP 单次订阅上限
+    _HEARTBEAT_INTERVAL: Final[float] = 30.0  # 心跳检测间隔
+    _HEARTBEAT_TIMEOUT: Final[float] = 60.0   # 心跳超时阈值
+    _RECONNECT_JITTER: Final[float] = 0.3     # 重连抖动系数（±30%）
 
     def __init__(self, config: GatewayConfig) -> None:
         """
@@ -151,6 +165,13 @@ class CtpMarketGateway(AbstractGateway):
         # === 线程安全 ===
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = threading.Lock()
+
+        # === 心跳检测 ===
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._last_heartbeat: datetime = datetime.now(UTC_TZ)
+
+        # === 审计日志 ===
+        self._audit = get_audit_logger()
 
         self._logger.info(
             f"CtpMarketGateway 初始化完成: "
