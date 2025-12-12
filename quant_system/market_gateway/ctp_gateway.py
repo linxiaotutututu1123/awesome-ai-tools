@@ -448,6 +448,18 @@ class CtpMarketGateway(AbstractGateway):
             self._init_bar_generator(symbol)
 
         await self._set_state(GatewayState.RUNNING)
+
+        # WHY: 更新订阅数量指标
+        set_gateway_subscriptions(self.gateway_name, len(self._subscribed_symbols))
+
+        # WHY: 记录审计日志
+        self._audit.log(
+            "SUBSCRIBE",
+            gateway=self.gateway_name,
+            symbols=success_symbols[:10],  # 只记录前10个
+            total_count=len(success_symbols),
+        )
+
         self._logger.info(f"订阅完成: {len(success_symbols)} 个合约")
 
         return success_symbols
@@ -678,18 +690,38 @@ class CtpMarketGateway(AbstractGateway):
             # WHY: 转换原始数据
             tick = self._convert_tick(raw_data)
 
+            # WHY: 记录收到的 Tick
+            record_tick_received(self.gateway_name, tick.exchange)
+
             # WHY: 校验数据
             is_valid, errors = tick.validate()
             if not is_valid:
                 if self._config.data_filter.log_dirty_data:
                     self._logger.warning(f"脏数据: {tick.symbol}, errors={errors}")
                 tick.status = DataStatus.FILTERED
+                record_tick_filtered(self.gateway_name, errors[0] if errors else "unknown")
+                return
+
+            # WHY: 时间戳有效性验证
+            ts_valid, ts_reason = validate_timestamp(tick.timestamp)
+            if not ts_valid:
+                self._logger.debug(f"时间戳无效: {tick.symbol}, {ts_reason}")
+                record_tick_filtered(self.gateway_name, ts_reason.split(":")[0])
                 return
 
             # WHY: 乱序检测
             if not self._check_tick_order(tick):
                 self._logger.debug(f"乱序数据丢弃: {tick.symbol}")
+                record_tick_filtered(self.gateway_name, "out_of_order")
                 return
+
+            # WHY: 更新心跳时间
+            self._last_heartbeat = datetime.now(UTC_TZ)
+
+            # WHY: 记录延迟指标
+            latency = tick.latency_ms
+            if latency is not None:
+                record_tick_latency(self.gateway_name, latency / 1000.0)
 
             # WHY: 更新 K 线生成器
             self._update_bar_generators(tick)
@@ -702,7 +734,10 @@ class CtpMarketGateway(AbstractGateway):
 
             # WHY: 更新缓存
             self._tick_cache.append(tick)
-            self._last_tick_at = datetime.now(timezone.utc)
+            self._last_tick_at = datetime.now(UTC_TZ)
+
+            # WHY: 更新队列大小指标
+            set_queue_size(self.gateway_name, self._tick_queue.qsize())
 
             # WHY: 触发回调
             for callback in self._tick_callbacks:
@@ -727,14 +762,15 @@ class CtpMarketGateway(AbstractGateway):
         trading_day = raw.get("TradingDay", "19700101")
 
         try:
+            # WHY: CTP 返回的是中国时间，需要正确标记时区
             ts = datetime.strptime(
                 f"{trading_day} {update_time}",
                 "%Y%m%d %H:%M:%S",
-            ).replace(tzinfo=timezone.utc)
+            ).replace(tzinfo=CHINA_TZ)
             # WHY: 添加毫秒精度
             ts = ts.replace(microsecond=update_ms * 1000)
         except ValueError:
-            ts = datetime.now(timezone.utc)
+            ts = datetime.now(CHINA_TZ)
 
         return TickData(
             symbol=raw.get("InstrumentID", ""),
