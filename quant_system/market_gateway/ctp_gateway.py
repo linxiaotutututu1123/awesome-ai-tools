@@ -240,9 +240,23 @@ class CtpMarketGateway(AbstractGateway):
                 )
 
             await self._set_state(GatewayState.CONNECTED)
-            self._connected_at = datetime.now(timezone.utc)
+            self._connected_at = datetime.now(UTC_TZ)
             self._consecutive_failures = 0
             self._reconnect_interval = self._config.reconnect.initial_interval
+
+            # WHY: 启动心跳检测任务
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+            # WHY: 记录审计日志
+            self._audit.log(
+                "CONNECT",
+                gateway=self.gateway_name,
+                status="success",
+                front_addr=self._ctp_config.front_addr,
+            )
+
+            # WHY: 更新 Prometheus 指标
+            set_gateway_state(self.gateway_name, "CONNECTED")
 
             self._logger.info("CTP 行情服务器连接成功")
 
@@ -304,6 +318,14 @@ class CtpMarketGateway(AbstractGateway):
         self._logger.info("正在断开 CTP 行情连接...")
 
         try:
+            # WHY: 取消心跳任务
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
             # WHY: 取消重连任务
             if self._reconnect_task and not self._reconnect_task.done():
                 self._reconnect_task.cancel()
@@ -319,11 +341,41 @@ class CtpMarketGateway(AbstractGateway):
                 self._spi = None
 
             await self._set_state(GatewayState.DISCONNECTED)
+
+            # WHY: 记录审计日志
+            self._audit.log(
+                "DISCONNECT",
+                gateway=self.gateway_name,
+                status="success",
+            )
+
+            set_gateway_state(self.gateway_name, "DISCONNECTED")
             self._logger.info("CTP 行情连接已断开")
 
         except Exception as e:
             self._logger.error(f"断开连接异常: {e}", exc_info=True)
             raise
+
+    async def _heartbeat_loop(self) -> None:
+        """
+        心跳检测循环。
+
+        # WHY: 检测连接是否存活，超时则触发重连
+        """
+        while self._state in (GatewayState.CONNECTED, GatewayState.RUNNING):
+            await asyncio.sleep(self._HEARTBEAT_INTERVAL)
+
+            # WHY: 检查最后收到数据的时间
+            now = datetime.now(UTC_TZ)
+            elapsed = (now - self._last_heartbeat).total_seconds()
+
+            if elapsed > self._HEARTBEAT_TIMEOUT:
+                self._logger.warning(
+                    f"心跳超时: {elapsed:.1f}s > {self._HEARTBEAT_TIMEOUT}s"
+                )
+                # WHY: 触发重连
+                if self._state == GatewayState.RUNNING:
+                    asyncio.create_task(self._do_reconnect())
 
     # =========================================================================
     # 订阅管理
@@ -499,8 +551,12 @@ class CtpMarketGateway(AbstractGateway):
             if self._consecutive_failures >= self._config.reconnect.alert_threshold:
                 await self._on_reconnect_failed()
 
+            # WHY: 计算带抖动的等待时间（防止重连风暴）
+            jitter = random.uniform(1 - self._RECONNECT_JITTER, 1 + self._RECONNECT_JITTER)
+            wait_time = self._reconnect_interval * jitter
+
             # WHY: 等待退避间隔
-            await asyncio.sleep(self._reconnect_interval)
+            await asyncio.sleep(wait_time)
 
             try:
                 # WHY: 先断开旧连接
@@ -537,11 +593,24 @@ class CtpMarketGateway(AbstractGateway):
                     await self._restore_subscriptions()
 
                 await self._set_state(GatewayState.RUNNING)
+
+                # WHY: 记录重连成功指标
+                record_reconnect(self.gateway_name, success=True)
+                self._audit.log(
+                    "RECONNECT",
+                    gateway=self.gateway_name,
+                    status="success",
+                    attempts=self._consecutive_failures,
+                )
+
                 self._logger.info("重连成功，已恢复订阅")
                 return True
 
             except Exception as e:
                 self._logger.error(f"重连失败: {e}")
+
+                # WHY: 记录重连失败指标
+                record_reconnect(self.gateway_name, success=False)
                 # WHY: 计算下次重连间隔（指数退避）
                 self._reconnect_interval = min(
                     self._reconnect_interval * self._config.reconnect.multiplier,
