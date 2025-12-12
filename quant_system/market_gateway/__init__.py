@@ -55,6 +55,7 @@ from .base import (
     BarCallback,
     StateCallback,
 )
+from .ctp_gateway import CtpMarketGateway
 
 __all__: list[str] = [
     # 错误码
@@ -94,6 +95,8 @@ __all__: list[str] = [
     "DepthCallback",
     "BarCallback",
     "StateCallback",
+    # 实现类
+    "CtpMarketGateway",
 ]
 
 __version__ = "1.0.0"

@@ -448,3 +448,435 @@ class CtpMarketGateway(AbstractGateway):
             else:
                 result.append(symbol)
         return list(set(result))  # WHY: 去重
+
+    # =========================================================================
+    # 重连逻辑
+    # =========================================================================
+
+    async def _do_reconnect(self) -> bool:
+        """
+        执行指数退避重连。
+
+        重连策略：
+        - 初始间隔 1s，乘数 2，最大 60s
+        - 无限重试（用户要求）
+        - 达到告警阈值时发送钉钉告警
+
+        Returns:
+            重连是否成功
+        """
+        await self._set_state(GatewayState.RECONNECTING)
+
+        while True:
+            self._consecutive_failures += 1
+            self._logger.warning(
+                f"第 {self._consecutive_failures} 次重连，"
+                f"间隔 {self._reconnect_interval:.1f}s"
+            )
+
+            # WHY: 检查是否需要告警
+            if self._consecutive_failures >= self._config.reconnect.alert_threshold:
+                await self._on_reconnect_failed()
+
+            # WHY: 等待退避间隔
+            await asyncio.sleep(self._reconnect_interval)
+
+            try:
+                # WHY: 先断开旧连接
+                if self._api:
+                    self._api.Release()
+                    self._api = None
+
+                # WHY: 重新初始化
+                await self._init_ctp_api()
+
+                # WHY: 等待登录
+                self._login_event.clear()
+                try:
+                    await asyncio.wait_for(
+                        self._login_event.wait(),
+                        timeout=self._config.connect_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionTimeoutException(
+                        message="重连超时",
+                        timeout_seconds=self._config.connect_timeout,
+                    )
+
+                if self._login_error:
+                    raise AuthenticationException(message=self._login_error)
+
+                # WHY: 重连成功，恢复订阅
+                await self._set_state(GatewayState.CONNECTED)
+                self._consecutive_failures = 0
+                self._reconnect_interval = self._config.reconnect.initial_interval
+
+                # WHY: 自动恢复订阅
+                if self._subscribed_symbols:
+                    await self._restore_subscriptions()
+
+                await self._set_state(GatewayState.RUNNING)
+                self._logger.info("重连成功，已恢复订阅")
+                return True
+
+            except Exception as e:
+                self._logger.error(f"重连失败: {e}")
+                # WHY: 计算下次重连间隔（指数退避）
+                self._reconnect_interval = min(
+                    self._reconnect_interval * self._config.reconnect.multiplier,
+                    self._config.reconnect.max_interval,
+                )
+
+    async def _restore_subscriptions(self) -> None:
+        """恢复之前的订阅。"""
+        symbols = list(self._subscribed_symbols)
+        self._subscribed_symbols.clear()  # WHY: 清空后重新订阅
+        await self.subscribe(symbols)
+
+    async def _on_reconnect_failed(self) -> None:
+        """
+        重连失败告警处理。
+
+        # REVIEW: 如果重连 10 次失败如何告警？
+        # 答：调用 _alert_callback 发送钉钉告警
+        """
+        message = (
+            f"[告警] CTP 行情网关重连失败\n"
+            f"网关: {self.gateway_name}\n"
+            f"连续失败: {self._consecutive_failures} 次\n"
+            f"当前间隔: {self._reconnect_interval:.1f}s"
+        )
+
+        self._logger.critical(message)
+
+        if self._alert_callback:
+            try:
+                self._alert_callback("CRITICAL", message)
+            except Exception as e:
+                self._logger.error(f"发送告警失败: {e}")
+
+    # =========================================================================
+    # 数据处理
+    # =========================================================================
+
+    def _on_tick_data(self, raw_data: dict[str, Any]) -> None:
+        """
+        处理 CTP 原始 Tick 数据（在 CTP 回调线程中调用）。
+
+        处理流程：
+        1. 转换为 TickData
+        2. 校验数据有效性
+        3. 检测乱序
+        4. 更新 K 线
+        5. 放入队列
+
+        # RISK: 此方法在 CTP 回调线程中调用，需要线程安全
+        # 缓解措施: 使用 run_coroutine_threadsafe 桥接到 asyncio
+        """
+        if self._loop is None:
+            return
+
+        # WHY: 使用线程安全方式调度到 asyncio 线程
+        asyncio.run_coroutine_threadsafe(
+            self._process_tick_async(raw_data),
+            self._loop,
+        )
+
+    async def _process_tick_async(self, raw_data: dict[str, Any]) -> None:
+        """异步处理 Tick 数据。"""
+        try:
+            # WHY: 转换原始数据
+            tick = self._convert_tick(raw_data)
+
+            # WHY: 校验数据
+            is_valid, errors = tick.validate()
+            if not is_valid:
+                if self._config.data_filter.log_dirty_data:
+                    self._logger.warning(f"脏数据: {tick.symbol}, errors={errors}")
+                tick.status = DataStatus.FILTERED
+                return
+
+            # WHY: 乱序检测
+            if not self._check_tick_order(tick):
+                self._logger.debug(f"乱序数据丢弃: {tick.symbol}")
+                return
+
+            # WHY: 更新 K 线生成器
+            self._update_bar_generators(tick)
+
+            # WHY: 放入队列（非阻塞）
+            try:
+                self._tick_queue.put_nowait(tick)
+            except asyncio.QueueFull:
+                self._logger.warning("Tick 队列已满，丢弃数据")
+
+            # WHY: 更新缓存
+            self._tick_cache.append(tick)
+            self._last_tick_at = datetime.now(timezone.utc)
+
+            # WHY: 触发回调
+            for callback in self._tick_callbacks:
+                try:
+                    await callback(tick)
+                except Exception as e:
+                    self._logger.error(f"Tick 回调异常: {e}")
+
+        except Exception as e:
+            self._logger.error(f"处理 Tick 异常: {e}", exc_info=True)
+
+    def _convert_tick(self, raw: dict[str, Any]) -> TickData:
+        """
+        转换 CTP 原始数据为 TickData。
+
+        # RISK: CTP 字段名可能变化
+        # 缓解措施: 使用 get() 方法带默认值
+        """
+        # WHY: 解析时间戳
+        update_time = raw.get("UpdateTime", "00:00:00")
+        update_ms = raw.get("UpdateMillisec", 0)
+        trading_day = raw.get("TradingDay", "19700101")
+
+        try:
+            ts = datetime.strptime(
+                f"{trading_day} {update_time}",
+                "%Y%m%d %H:%M:%S",
+            ).replace(tzinfo=timezone.utc)
+            # WHY: 添加毫秒精度
+            ts = ts.replace(microsecond=update_ms * 1000)
+        except ValueError:
+            ts = datetime.now(timezone.utc)
+
+        return TickData(
+            symbol=raw.get("InstrumentID", ""),
+            exchange=raw.get("ExchangeID", ""),
+            timestamp=ts,
+            last_price=Decimal(str(raw.get("LastPrice", 0))),
+            volume=int(raw.get("Volume", 0)),
+            turnover=Decimal(str(raw.get("Turnover", 0))),
+            open_interest=int(raw.get("OpenInterest", 0)),
+            bid_price_1=Decimal(str(raw.get("BidPrice1", 0))),
+            bid_volume_1=int(raw.get("BidVolume1", 0)),
+            ask_price_1=Decimal(str(raw.get("AskPrice1", 0))),
+            ask_volume_1=int(raw.get("AskVolume1", 0)),
+            pre_close=Decimal(str(raw.get("PreClosePrice", 0))),
+            pre_settlement=Decimal(str(raw.get("PreSettlementPrice", 0))),
+            upper_limit=Decimal(str(raw.get("UpperLimitPrice", 0))),
+            lower_limit=Decimal(str(raw.get("LowerLimitPrice", 0))),
+            gateway_name=self.gateway_name,
+        )
+
+    def _check_tick_order(self, tick: TickData) -> bool:
+        """
+        检查 Tick 是否乱序。
+
+        # REVIEW: 行情乱序如何处理？
+        # 答：丢弃时间戳早于上一条的数据
+        """
+        last_time = self._last_tick_time.get(tick.symbol)
+        if last_time and tick.timestamp < last_time:
+            return False
+        self._last_tick_time[tick.symbol] = tick.timestamp
+        return True
+
+    # =========================================================================
+    # K 线生成
+    # =========================================================================
+
+    def _init_bar_generator(self, symbol: str) -> None:
+        """初始化合约的 K 线生成器。"""
+        if symbol not in self._bar_generators:
+            self._bar_generators[symbol] = {
+                BarPeriod.MINUTE_1: _BarGenerator(symbol, BarPeriod.MINUTE_1),
+                BarPeriod.MINUTE_5: _BarGenerator(symbol, BarPeriod.MINUTE_5),
+            }
+
+    def _update_bar_generators(self, tick: TickData) -> None:
+        """更新 K 线生成器。"""
+        generators = self._bar_generators.get(tick.symbol)
+        if not generators:
+            return
+
+        for period, generator in generators.items():
+            bar = generator.update(tick)
+            if bar:
+                # WHY: K 线完成，触发回调
+                self._on_bar_complete(bar)
+
+    def _on_bar_complete(self, bar: BarData) -> None:
+        """K 线完成回调。"""
+        if self._loop is None:
+            return
+
+        async def notify_callbacks() -> None:
+            for callback in self._bar_callbacks:
+                try:
+                    await callback(bar)
+                except Exception as e:
+                    self._logger.error(f"Bar 回调异常: {e}")
+
+        asyncio.run_coroutine_threadsafe(notify_callbacks(), self._loop)
+
+    def __repr__(self) -> str:
+        return (
+            f"CtpMarketGateway("
+            f"name={self.gateway_name}, "
+            f"state={self._state.name}, "
+            f"subscriptions={self.subscription_count}, "
+            f"cache_size={len(self._tick_cache)})"
+        )
+
+
+# =============================================================================
+# 辅助类
+# =============================================================================
+
+
+class _BarGenerator:
+    """
+    K 线生成器。
+
+    根据 Tick 数据实时生成 K 线。
+    """
+
+    __slots__ = (
+        "symbol",
+        "period",
+        "_current_bar",
+        "_last_bar_time",
+    )
+
+    def __init__(self, symbol: str, period: BarPeriod) -> None:
+        self.symbol = symbol
+        self.period = period
+        self._current_bar: BarData | None = None
+        self._last_bar_time: datetime | None = None
+
+    def update(self, tick: TickData) -> BarData | None:
+        """
+        更新 K 线。
+
+        Args:
+            tick: 新的 Tick 数据
+
+        Returns:
+            如果 K 线完成则返回 BarData，否则返回 None
+        """
+        bar_time = self._get_bar_time(tick.timestamp)
+
+        # WHY: 新 K 线周期开始
+        if self._last_bar_time is None or bar_time > self._last_bar_time:
+            completed_bar = self._current_bar
+            self._current_bar = BarData(
+                symbol=tick.symbol,
+                exchange=tick.exchange,
+                period=self.period,
+                bar_datetime=bar_time,
+                open_price=tick.last_price,
+                high_price=tick.last_price,
+                low_price=tick.last_price,
+                close_price=tick.last_price,
+                volume=tick.volume,
+                gateway_name=tick.gateway_name,
+            )
+            self._last_bar_time = bar_time
+            return completed_bar
+
+        # WHY: 更新当前 K 线
+        if self._current_bar:
+            self._current_bar.high_price = max(
+                self._current_bar.high_price,
+                tick.last_price,
+            )
+            self._current_bar.low_price = min(
+                self._current_bar.low_price,
+                tick.last_price,
+            )
+            self._current_bar.close_price = tick.last_price
+            self._current_bar.volume = tick.volume
+
+        return None
+
+    def _get_bar_time(self, ts: datetime) -> datetime:
+        """获取 K 线起始时间。"""
+        if self.period == BarPeriod.MINUTE_1:
+            return ts.replace(second=0, microsecond=0)
+        elif self.period == BarPeriod.MINUTE_5:
+            minute = (ts.minute // 5) * 5
+            return ts.replace(minute=minute, second=0, microsecond=0)
+        else:
+            return ts.replace(minute=0, second=0, microsecond=0)
+
+
+class _CtpMdSpi:
+    """
+    CTP 行情 SPI 回调实现。
+
+    # RISK: 所有回调在 CTP 内部线程执行
+    # 缓解措施: 回调中只做最小处理，复杂逻辑转发到 asyncio
+    """
+
+    def __init__(self, gateway: CtpMarketGateway) -> None:
+        self._gateway = gateway
+        self._logger = logging.getLogger(f"ctp_spi.{gateway.gateway_name}")
+
+    def OnFrontConnected(self) -> None:
+        """前置机连接成功回调。"""
+        self._logger.info("前置机连接成功，开始登录...")
+
+        # WHY: 发起登录请求
+        if self._gateway._api:
+            self._gateway._request_id += 1
+            req = {
+                "BrokerID": self._gateway._ctp_config.broker_id,
+                "UserID": self._gateway._ctp_config.investor_id,
+                "Password": self._gateway._ctp_config.password.get_secret_value(),
+            }
+            self._gateway._api.ReqUserLogin(req, self._gateway._request_id)
+
+    def OnFrontDisconnected(self, reason: int) -> None:
+        """前置机断开回调。"""
+        self._logger.warning(f"前置机断开，原因码: {reason}")
+
+        # WHY: 触发重连
+        if self._gateway._loop and self._gateway._state == GatewayState.RUNNING:
+            asyncio.run_coroutine_threadsafe(
+                self._gateway._do_reconnect(),
+                self._gateway._loop,
+            )
+
+    def OnRspUserLogin(
+        self,
+        data: dict[str, Any],
+        error: dict[str, Any],
+        request_id: int,
+        is_last: bool,
+    ) -> None:
+        """登录响应回调。"""
+        if error and error.get("ErrorID", 0) != 0:
+            self._gateway._login_error = error.get("ErrorMsg", "未知错误")
+            self._logger.error(f"登录失败: {self._gateway._login_error}")
+        else:
+            self._logger.info("登录成功")
+
+        # WHY: 通知等待的 connect() 方法
+        self._gateway._login_event.set()
+
+    def OnRtnDepthMarketData(self, data: dict[str, Any]) -> None:
+        """行情数据回调。"""
+        self._gateway._on_tick_data(data)
+
+    def OnRspSubMarketData(
+        self,
+        data: dict[str, Any],
+        error: dict[str, Any],
+        request_id: int,
+        is_last: bool,
+    ) -> None:
+        """订阅响应回调。"""
+        if error and error.get("ErrorID", 0) != 0:
+            self._logger.error(
+                f"订阅失败: {data.get('InstrumentID')}, "
+                f"error={error.get('ErrorMsg')}"
+            )
+        else:
+            self._logger.debug(f"订阅成功: {data.get('InstrumentID')}")
